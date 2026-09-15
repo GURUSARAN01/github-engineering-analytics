@@ -6,6 +6,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import boto3
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+)
+
 
 # ---------------------------------------------------------
 # Configuration
@@ -25,6 +31,18 @@ RAW_DIR = Path("data/raw/github")
 STATE_DIR = Path("data/state")
 
 WATERMARK_FILE = STATE_DIR / "pull_requests_watermark.json"
+
+AWS_PROFILE = os.getenv(
+    "AWS_PROFILE",
+    "github-de",
+)
+
+AWS_REGION = os.getenv(
+    "AWS_REGION",
+    "eu-central-1",
+)
+
+S3_BUCKET = os.getenv("S3_BUCKET")
 
 # ---------------------------------------------------------
 # HTTP headers
@@ -237,6 +255,52 @@ def save_raw_json(records: list[dict], owner: str, repo: str,) -> Path:
     return file_path
 
 # ---------------------------------------------------------
+# Build S3 Client
+# ---------------------------------------------------------
+
+def build_s3_client():
+
+    session = boto3.Session(
+        profile_name=AWS_PROFILE,
+        region_name=AWS_REGION,
+    )
+
+    return session.client("s3")
+
+def build_s3_key(file_path: Path,) -> str:
+    relative_path = file_path.relative_to(RAW_DIR)
+
+    return("raw/github/" + relative_path.as_posix())
+
+
+def upload_raw_file_to_s3(file_path: Path,) -> str:
+    if not S3_BUCKET:
+        raise ValueError("S3_BUCKET is not configured.")
+    s3_client = build_s3_client()
+
+    s3_key = build_s3_key(file_path)
+
+    try:
+        s3_client.upload_file(
+            str(file_path),
+            S3_BUCKET,
+            s3_key,
+            ExtraArgs={
+                "ContentType":
+                "application/json"
+            },
+        )
+
+    except (ClientError, BotoCoreError,) as exec:
+        raise RuntimeError(
+            f"Failed to upload "
+            f"{file_path} to S3"
+        ) from exec
+
+    return(f"s3://{S3_BUCKET}/{s3_key}")
+
+    
+# ---------------------------------------------------------
 # Main
 # ---------------------------------------------------------
 
@@ -248,7 +312,7 @@ def main():
 
     print("Current watermark:", watermark or "None - full initial extraction",)
 
-    records = fetch_pull_requests(owner=GITHUB_OWNER, repo=GITHUB_REPO, watermark=watermark, max_pages=3)
+    records = fetch_pull_requests(owner=GITHUB_OWNER, repo=GITHUB_REPO, watermark=watermark, max_pages=1)
 
     print(
         f"Extracted {len(records)} "
@@ -263,14 +327,21 @@ def main():
 
     print(f"Save raw data to: {file_path}")
 
+
+    file_path = save_raw_json(records, GITHUB_OWNER, GITHUB_REPO,)
+
+    print(f"Saved raw data to: {file_path}")
+
+    s3_uri = upload_raw_file_to_s3(file_path)
+    print(f"Uploaded raw data to: {s3_uri}")
+
     newest_updated_at = max(datetime.fromisoformat(
         record["updated_at"].replace(
             "Z", "+00:00"))
             for record in records
             )
 
-    save_watermark(newest_updated_at)
-
+    save_watermark(newest_updated_at)   
     print("New watermark: ", newest_updated_at)
 
 if __name__ == "__main__":
